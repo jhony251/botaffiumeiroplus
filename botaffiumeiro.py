@@ -1,21 +1,12 @@
-"""Main module for managing bot functionalities and modifying affiliate links."""
-
-from __future__ import annotations
-
 import logging
 import re
-import secrets
 import threading
-from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, urlparse
+import time
+import hashlib
+from urllib.parse import urlparse
 
-from config import ConfigurationManager
-from handlers.aliexpress_api_handler import AliexpressAPIHandler
-from handlers.aliexpress_handler import ALIEXPRESS_PATTERN, AliexpressHandler
-from handlers.pattern_handler import PatternHandler
-from handlers.patterns import PATTERNS
-from publicsuffix2 import get_sld
-import requests  # type: ignore[import-untyped]
+import requests
+from telegram import Message, Update
 from telegram.ext import (
     Application,
     CallbackContext,
@@ -25,253 +16,227 @@ from telegram.ext import (
     filters,
 )
 
-if TYPE_CHECKING:
-    from telegram import Message, Update, User
-
-DOMAIN_PATTERNS = {
-    "aliexpress": ALIEXPRESS_PATTERN,
-}
+from config import ConfigurationManager
+from amazon.paapi import AmazonAPI
 
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(
-    logger.getEffectiveLevel() + 10
-    if logger.getEffectiveLevel() < logging.CRITICAL
-    else logging.CRITICAL
-)
 
+# Inicializamos config
 config_manager = ConfigurationManager()
 
+# =======================
+# AliExpress API Handler
+# =======================
 
-def is_user_excluded(user: User) -> bool:
-    """Check if the user is in the list of excluded users."""
+class AliexpressAPIHandler:
+    BASE_URL = "https://api.alibaba.com/openapi/param2/2/portals.open/api.getPromotionProductDetail/"
+
+    def __init__(self, config):
+        self.config = config
+        self.api_key = config.aliexpress_app_key
+        self.secret = config.aliexpress_app_secret
+
+    def _generate_signature(self, api_path: str, params: dict) -> str:
+        sorted_params = "".join(f"{k}{v}" for k, v in sorted(params.items()))
+        sign_string = f"{self.secret}{api_path}{sorted_params}{self.secret}"
+        return hashlib.md5(sign_string.encode("utf-8")).hexdigest()
+
+    def get_product_info(self, url: str) -> dict | None:
+        product_id = self.extract_product_id(url)
+        if not product_id:
+            return None
+
+        api_path = "/openapi/param2/2/portals.open/api.getPromotionProductDetail/"
+        params = {
+            "app_key": self.api_key,
+            "productId": product_id,
+            "timestamp": str(int(time.time() * 1000)),
+        }
+        params["sign"] = self._generate_signature(api_path, params)
+
+        try:
+            response = requests.get(self.BASE_URL, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            if "result" not in data:
+                return None
+
+            result = data["result"]
+            return {
+                "title": result.get("productTitle"),
+                "image_url": result.get("productMainImageUrl"),
+                "price": result.get("salePrice"),
+                "old_price": result.get("originalPrice"),
+                "description": result.get("productDescription") or "Producto en AliExpress",
+            }
+
+        except Exception as e:
+            logger.exception("Error al obtener info del producto AliExpress: %s", e)
+            return None
+
+    def extract_product_id(self, url: str) -> str | None:
+        match = re.search(r"/item/(\d+)\.html", url)
+        return match.group(1) if match else None
+
+    def create_affiliate_link(self, url: str) -> str:
+        return f"{url}?aff_id={self.config.aliexpress_aff_id}"
+
+    def can_handle(self, url: str) -> bool:
+        return "aliexpress.com" in url
+
+# ================
+# Amazon API Handler
+# ================
+
+class AmazonAPIHandler:
+    def __init__(self, config):
+        self.config = config
+        self.api = AmazonAPI(
+            access_key=config.amazon_access_key,
+            secret_key=config.amazon_secret_key,
+            partner_tag=config.amazon_affiliate_tag,
+            country=config.amazon_country
+        )
+
+    def can_handle(self, url: str) -> bool:
+        return "amazon." in url
+
+    def get_product_info(self, url: str) -> dict | None:
+        try:
+            asin = self.extract_asin(url)
+            if not asin:
+                return None
+
+            result = self.api.get_items([asin])
+            item = result.items_result.items[0]
+
+            return {
+                "title": item.item_info.title.display_value,
+                "image_url": item.images.primary.large.url,
+                "price": item.offers.listings[0].price.display_amount,
+                "old_price": item.offers.listings[0].price.savings_basis if item.offers.listings[0].price.savings_basis else None,
+                "description": item.item_info.features.display_values[0] if item.item_info.features else "Producto de Amazon",
+            }
+
+        except Exception as e:
+            logger.exception("Error al obtener info de Amazon: %s", e)
+            return None
+
+    def extract_asin(self, url: str) -> str | None:
+        match = re.search(r"/([A-Z0-9]{10})(?:[/?]|$)", url)
+        return match.group(1) if match else None
+
+    def create_affiliate_link(self, url: str) -> str:
+        asin = self.extract_asin(url)
+        if asin:
+            return f"https://www.amazon.{self.config.amazon_country}/dp/{asin}?tag={self.config.amazon_affiliate_tag}"
+        return url
+
+# ===============
+# Utilidades
+# ===============
+
+def is_user_excluded(user) -> bool:
     user_id = user.id
     username = user.username
-    logger.debug("Checking if user %s (ID: %s) is excluded.", username, user_id)
     excluded_users = config_manager.excluded_users
-    excluded = user_id in excluded_users or (username and username in excluded_users)
-    logger.debug("User %s (ID: %s) is excluded: %s", username, user_id, excluded)
-    return excluded
+    return user_id in excluded_users or (username and username in excluded_users)
 
-
-def expand_shortened_url(url: str) -> str:
-    """Expand shortened URLs by following redirects using a HEAD request."""
-    logger.info("Try expanding shortened URL: %s", url)
-    # Strip trailing punctuation if present
-    stripped_url = url.rstrip(".,")
+def shorten_url(url: str) -> str:
     try:
-        response = requests.get(
-            stripped_url, allow_redirects=True, timeout=config_manager.TIMEOUT
-        )
-    except requests.RequestException:
-        logger.exception("Error expanding shortened URL: %s", url)
+        response = requests.get(f"https://tinyurl.com/api-create.php?url={url}")
+        return response.text if response.status_code == 200 else url
+    except Exception:
         return url
-    else:
-        expanded_url = response.url
-        logger.info("Expanded URL %s to full link: %s", stripped_url, expanded_url)
-        return expanded_url
 
+def prepare_message(message: Message) -> str:
+    return message.text if message and message.text else ""
 
-def extract_embedded_url(query_params: dict[str, list[str]]) -> set[str]:
-    """Extract any valid URLs embedded in query parameters.
-
-    Args:
-    ----
-        query_params: A dictionary of query parameters from a URL.
-
-    Returns:
-    -------
-        A set of embedded domains found in the query parameters.
-
-    """
-    embedded_domains = set()
-    for values in query_params.values():
-        for value in values:
-            parsed_url = urlparse(value)
-            if parsed_url.scheme in ["http", "https"]:  # Check if it's a valid URL
-                domain = get_sld(parsed_url.netloc)
-                embedded_domains.add(domain)
-    return embedded_domains
-
-
-def extract_domains_from_message(message_text: str) -> tuple[set, str]:
-    """Extract domains from a message using domain patterns and searches for embedded URLs.
-
-    Additionally, expands short URLs and replaces them in the message text.
-
-    Args:
-    ----
-    message_text: The text of the message to search for domains.
-
-    Returns:
-    -------
-    A tuple containing:
-        - A set of domains found in the message.
-        - The modified message text with expanded URLs.
-
-    """
-    domains = set()
-
-    urls_in_message = re.findall(r"https?://[^\s]+", message_text)
-
-    for url in urls_in_message:
-        expanded_url = expand_shortened_url(url)
-        message_text = message_text.replace(url, expanded_url)
-        parsed_url = urlparse(expanded_url)
-        domain = get_sld(parsed_url.netloc)
-        query_params = parse_qs(parsed_url.query)
-        embedded_domains = extract_embedded_url(query_params)
-
-        if embedded_domains:
-            domains.update(embedded_domains)
-        else:
-            for pattern in DOMAIN_PATTERNS.values():
-                if re.match(pattern, expanded_url):
-                    domains.add(domain)
-            for config in PATTERNS.values():
-                if re.match(config["pattern"], expanded_url):
-                    domains.add(domain)
-                    break
-
-    return domains, message_text
-
-
-def select_user_for_domain(domain: str) -> dict | None:
-    """Select a user for the given domain based on percentages in domain_percentage_table."""
-    domain_data = config_manager.domain_percentage_table.get(domain, [])
-
-    if not domain_data:
-        return None
-
-    choices = [(entry["user"], entry["percentage"]) for entry in domain_data]
-
-    rand_choice = secrets.SystemRandom().uniform(0, 100)
-    current = 0
-
-    for user, percentage in choices:
-        current += percentage
-        if rand_choice <= current:
-            return config_manager.all_users_configurations.get(user, {})
-
-    return config_manager.all_users_configurations.get(choices[0][0], None)
-
-
-def choose_users(domains: set[str]) -> dict:
-    """Handle the domains and selects users randomly based on domain configurations."""
-    selected_users = {}
-    for domain in domains:
-        selected_user_data = select_user_for_domain(domain)
-        if selected_user_data:
-            selected_users[domain] = selected_user_data
-    return selected_users
-
-
-def prepare_message(message: Message, default_domains: set[str] | None = None) -> dict:
-    """Prepare the message by extracting domains, selecting users, and returning a processing context."""
-    if not message or not message.text:
-        return {
-            "message": message,
-            "modified_message": None,
-            "selected_users": {},
-        }
-
-    message_text = message.text
-    if default_domains:
-        domains = default_domains
-        modified_message = message_text
-    else:
-        domains, modified_message = extract_domains_from_message(message_text)
-
-    selected_users = choose_users(domains)
-    return {
-        "message": message,
-        "modified_message": modified_message,
-        "selected_users": selected_users,
-    }
-
+# ====================
+# Procesamiento Mensaje
+# ====================
 
 async def process_link_handlers(message: Message) -> None:
-    """Process all link handlers for Amazon, Awin, Admitad, and AliExpress."""
-    logger.info("Processing link handlers for message ID: %s...", message.message_id)
-    context = prepare_message(message)
-    processed = await PatternHandler(config_manager).handle_links(context)
-    processed |= await AliexpressAPIHandler(config_manager).handle_links(context)
+    text = prepare_message(message)
+    urls = re.findall(r"https?://[\w./?=&%-]+", text)
 
-    if not processed:
-        await AliexpressHandler(config_manager).handle_links(context)
+    handlers = [AliexpressAPIHandler(config_manager), AmazonAPIHandler(config_manager)]
 
-    logger.info(
-        "Finished processing link handlers for message ID: %s.", message.message_id
-    )
+    for url in urls:
+        for handler in handlers:
+            if handler.can_handle(url):
+                product = handler.get_product_info(url)
+                if product:
+                    affiliate_link = handler.create_affiliate_link(url)
+                    short_link = shorten_url(affiliate_link)
 
+                    caption = f"<b>{product['title']}</b>\n"
+                    caption += f"💸 Precio: {product['price']}\n"
+                    if product.get("old_price"):
+                        caption += f"💰 Antes: {product['old_price']}\n"
+                    if product.get("description"):
+                        caption += f"📝 {product['description']}\n"
+                    caption += f"🔗 {short_link}"
+
+                    if product.get("image_url"):
+                        await message.reply_photo(photo=product['image_url'], caption=caption, parse_mode="HTML")
+                    else:
+                        await message.reply_text(caption, parse_mode="HTML")
+                    break
+                else:
+                    await message.reply_text(f"🔗 {url}")
+
+# =========================
+# Comando /descuentos
+# =========================
+
+async def handle_discount_command(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text("🧾 No hay descuentos activos todavía")
+
+# =========================
+# Modificar Enlaces (Handler)
+# =========================
 
 async def modify_link(update: Update, _: CallbackContext) -> None:
-    """Modify Amazon, AliExpress, Awin, and Admitad links in messages."""
-    logger.info("Received new update (ID: %s).", update.update_id)
-
     if not update.message or not update.message.text:
-        logger.info(
-            "%s: Update with a message without text. Skipping.", update.update_id
-        )
         return
-
     if not update.effective_user:
-        logger.info("%s: Update without user. Skipping.", update.update_id)
         return
-
     if is_user_excluded(update.effective_user):
-        logger.info(
-            "%s: Update with a message from excluded user %s (ID: %s). Skipping.",
-            update.update_id,
-            update.effective_user.username,
-            update.effective_user.id,
-        )
         return
 
-    message = update.message
-    logger.info(
-        "%s: Processing update message (ID: %s)...",
-        update.update_id,
-        update.message.message_id,
-    )
+    await process_link_handlers(update.message)
 
-    await process_link_handlers(message)
-    logger.info("%s: Update processed.", update.update_id)
-
+# =========================
+# Carga periódica de config
+# =========================
 
 def reload_config_periodically(interval: int) -> None:
-    """Reload the configuration periodically every `interval` seconds."""
     config_manager.load_configuration()
     threading.Timer(interval, reload_config_periodically, [interval]).start()
 
-
-async def handle_discount_command(update: Update, context: dict) -> None:
-    """Manage discount codes calling 'show_discount_codes' of AliexpressHandler."""
-    logger.info("Processing discount command: %s", update.message.text)
-
-    context = prepare_message(update.message, {"aliexpress.com"})
-    await AliexpressHandler(config_manager).show_discount_codes(context)
-
-    logger.info("Discount code shown for command: %s", update.message.text)
-
+# =========================
+# Registro de comandos
+# =========================
 
 def register_discount_handlers(application: Application) -> None:
-    """Registry dinamically bot discount commands."""
     for keyword in config_manager.discount_keywords:
         application.add_handler(CommandHandler(keyword, handle_discount_command))
 
+# =========================
+# MAIN
+# =========================
 
 def main() -> None:
-    """Start the bot application here."""
-    # Initialize ConfigurationManager
     config_manager.load_configuration()
 
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=config_manager.log_level,
     )
-    logger.info("Configuring the bot")
+    logger.info("Bot iniciado")
 
-    # Schedule a job to reload configuration every day
     reload_thread = threading.Thread(
         target=reload_config_periodically, args=(24 * 60 * 60,), daemon=True
     )
@@ -287,9 +252,8 @@ def main() -> None:
         MessageHandler(filters.ALL & filters.ChatType.GROUPS, modify_link)
     )
 
-    logger.info("Starting the bot")
+    logger.info("Ejecutando el bot...")
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
